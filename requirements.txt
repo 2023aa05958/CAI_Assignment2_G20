@@ -1,3 +1,4 @@
+sqlite3 >= 3.35.0
 streamlit>=1.30.0
 chromadb[duckdb]>=0.4.3
 duckdb>=0.9.2
