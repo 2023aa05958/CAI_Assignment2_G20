@@ -53,7 +53,7 @@ def split_documents(documents, chunk_size=600, chunk_overlap=100):
 # ✅ Initialize or Load ChromaDB
 def setup_or_load_vector_db(chunks, embedding_model):
     if os.path.exists(CHROMA_DB_DIR) and os.listdir(CHROMA_DB_DIR):
-        return Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embedding_model)
+        return Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embedding_model, settings={"chroma_db_impl": "duckdb"})  # Use DuckDB instead of SQLite
     return Chroma.from_documents(chunks, embedding_model, persist_directory=CHROMA_DB_DIR)
 
 # ✅ Load or Train BM25 Model
