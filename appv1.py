@@ -2,11 +2,10 @@ import os
 import re
 import pickle
 import streamlit as st
-import chromadb
 import json
 import numpy as np
 from rank_bm25 import BM25Okapi
-from langchain_chroma import Chroma
+from langchain.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -17,7 +16,7 @@ from gpt4all import GPT4All
 from tenacity import retry, stop_after_attempt, wait_fixed  
 
 # Paths
-CHROMA_DB_DIR = "chroma_db"
+FAISS_DB_PATH = "faiss_index"
 DOCUMENTS_DIR = "data"
 BM25_MODEL_PATH = "bm25_model.pkl"
 
@@ -50,11 +49,18 @@ def split_documents(documents, chunk_size=600, chunk_overlap=100):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     return text_splitter.split_documents(documents) if documents else []
 
-# ✅ Initialize or Load ChromaDB
-def setup_or_load_vector_db(chunks, embedding_model):
-    if os.path.exists(CHROMA_DB_DIR) and os.listdir(CHROMA_DB_DIR):
-        return Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embedding_model, settings={"chroma_db_impl": "duckdb"})  # Use DuckDB instead of SQLite
-    return Chroma.from_documents(chunks, embedding_model, persist_directory=CHROMA_DB_DIR)
+# ✅ Initialize or Load FAISS Vector Database
+def setup_or_load_faiss(chunks, embedding_model):
+    """ Loads FAISS from disk if available, otherwise creates a new one """
+    if os.path.exists(FAISS_DB_PATH):
+        print("✅ Loading existing FAISS index...")
+        vector_db = FAISS.load_local(FAISS_DB_PATH, embedding_model)
+    else:
+        print("⚙️ Creating new FAISS index...")
+        vector_db = FAISS.from_documents(chunks, embedding_model)
+        vector_db.save_local(FAISS_DB_PATH)  # Save FAISS index to disk
+    
+    return vector_db
 
 # ✅ Load or Train BM25 Model
 def setup_or_load_bm25(chunks):
@@ -81,7 +87,7 @@ def validate_financial_query(query):
         return query
     return None  # Rejects irrelevant queries
 
-# ✅ Hybrid Retrieval (BM25 + Embeddings) with Confidence Score Calculation
+# ✅ Hybrid Retrieval (BM25 + FAISS Embeddings) with Confidence Score Calculation
 def hybrid_financial_retrieval(vector_db, bm25_model, corpus, query, k=3):
     # BM25 retrieval
     query_tokens = query.split()
@@ -89,12 +95,12 @@ def hybrid_financial_retrieval(vector_db, bm25_model, corpus, query, k=3):
     top_bm25_indices = np.argsort(bm25_scores)[::-1][:k]
     bm25_results = [(Document(page_content=corpus[i]), bm25_scores[i]) for i in top_bm25_indices]
 
-    # Embedding-based retrieval with similarity scores
+    # Embedding-based retrieval with similarity scores (FAISS)
     dense_results = vector_db.similarity_search_with_score(query, k=k)
     dense_results = [(Document(page_content=doc.page_content), score) for doc, score in dense_results]
 
     # Normalize BM25 scores
-    if bm25_scores:
+    if bm25_scores.size > 0:
         max_bm25 = max(bm25_scores)
         if max_bm25 > 0:
             bm25_results = [(doc, score / max_bm25) for doc, score in bm25_results]
@@ -130,7 +136,7 @@ memory = ConversationBufferMemory(memory_key="chat_history", input_key="query")
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 documents = load_documents()
 chunks = split_documents(documents)
-vector_db = setup_or_load_vector_db(chunks, embedding_model)  
+vector_db = setup_or_load_faiss(chunks, embedding_model)  
 bm25_model, corpus = setup_or_load_bm25(chunks)
 llm = load_gpt4all()
 
