@@ -1,5 +1,6 @@
 import os
 import re
+import pickle
 import streamlit as st
 import chromadb
 import json
@@ -18,6 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 # Paths
 CHROMA_DB_DIR = "chroma_db"
 DOCUMENTS_DIR = "data"
+BM25_MODEL_PATH = "bm25_model.pkl"
 
 # ✅ Load GPT4All Model with Retry Guardrail
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))  
@@ -54,11 +56,22 @@ def setup_or_load_vector_db(chunks, embedding_model):
         return Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embedding_model)
     return Chroma.from_documents(chunks, embedding_model, persist_directory=CHROMA_DB_DIR)
 
-# ✅ Implement BM25 for Keyword-Based Retrieval
-def setup_bm25(chunks):
-    corpus = [doc.page_content for doc in chunks]
-    tokenized_corpus = [doc.split() for doc in corpus]
-    return BM25Okapi(tokenized_corpus), corpus
+# ✅ Load or Train BM25 Model
+def setup_or_load_bm25(chunks):
+    """ Loads BM25 from pickle if available, otherwise trains and saves it """
+    if os.path.exists(BM25_MODEL_PATH):
+        with open(BM25_MODEL_PATH, "rb") as f:
+            bm25_model, corpus = pickle.load(f)
+        print("✅ Loaded BM25 model from file.")
+    else:
+        corpus = [doc.page_content for doc in chunks]
+        tokenized_corpus = [doc.split() for doc in corpus]
+        bm25_model = BM25Okapi(tokenized_corpus)
+        with open(BM25_MODEL_PATH, "wb") as f:
+            pickle.dump((bm25_model, corpus), f)
+        print("✅ Trained and saved BM25 model.")
+    
+    return bm25_model, corpus
 
 # ✅ Guardrails: Query Validation using LLM
 def validate_financial_query(query):
@@ -68,26 +81,40 @@ def validate_financial_query(query):
         return query
     return None  # Rejects irrelevant queries
 
-# ✅ Hybrid Retrieval (BM25 + Embeddings)
+# ✅ Hybrid Retrieval (BM25 + Embeddings) with Confidence Score Calculation
 def hybrid_financial_retrieval(vector_db, bm25_model, corpus, query, k=3):
     # BM25 retrieval
     query_tokens = query.split()
     bm25_scores = bm25_model.get_scores(query_tokens)
     top_bm25_indices = np.argsort(bm25_scores)[::-1][:k]
-    bm25_results = [Document(page_content=corpus[i]) for i in top_bm25_indices]
+    bm25_results = [(Document(page_content=corpus[i]), bm25_scores[i]) for i in top_bm25_indices]
 
-    # Embedding-based retrieval
-    dense_results = vector_db.similarity_search(query, k=k)
+    # Embedding-based retrieval with similarity scores
+    dense_results = vector_db.similarity_search_with_score(query, k=k)
+    dense_results = [(Document(page_content=doc.page_content), score) for doc, score in dense_results]
 
-    # Merge and remove duplicates
-    results = {doc.page_content: doc for doc in bm25_results + dense_results}.values()
+    # Normalize BM25 scores
+    if bm25_scores:
+        max_bm25 = max(bm25_scores)
+        if max_bm25 > 0:
+            bm25_results = [(doc, score / max_bm25) for doc, score in bm25_results]
 
-    return list(results)
+    # Merge results and calculate confidence
+    combined_results = bm25_results + dense_results
+    unique_results = {}
+    for doc, score in combined_results:
+        if doc.page_content in unique_results:
+            unique_results[doc.page_content].append(score)
+        else:
+            unique_results[doc.page_content] = [score]
 
-# ✅ Re-ranking using Cross-Encoders (Placeholder for future expansion)
-def re_rank_results(results):
-    """ Simple re-ranking based on length (placeholder for cross-encoders) """
-    return sorted(results, key=lambda doc: len(doc.page_content), reverse=True)
+    # Calculate final confidence score (mean of available scores)
+    final_results = [(Document(page_content=doc), np.mean(scores)) for doc, scores in unique_results.items()]
+    
+    # Sort by confidence
+    final_results.sort(key=lambda x: x[1], reverse=True)
+
+    return final_results
 
 # ✅ Guardrail: Filter AI Output for Financial Relevance
 def filter_financial_ai_output(response):
@@ -104,7 +131,7 @@ embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-Mi
 documents = load_documents()
 chunks = split_documents(documents)
 vector_db = setup_or_load_vector_db(chunks, embedding_model)  
-bm25_model, corpus = setup_bm25(chunks)
+bm25_model, corpus = setup_or_load_bm25(chunks)
 llm = load_gpt4all()
 
 # ✅ Streamlit UI with Financial Guardrails
@@ -112,15 +139,6 @@ def main():
     st.set_page_config(page_title="Financial Report Chatbot (Llama 3)", layout="wide")
     st.title("📊 Financial Report Chatbot (Llama 3)")
     st.write("Ask questions about **Microsoft's financial performance** in 2023 & 2024.")
-
-    if st.sidebar.button("🔄 Reindex Financial Documents"):
-        with st.spinner("Reindexing financial documents..."):
-            global vector_db, bm25_model, corpus
-            documents = load_documents()
-            chunks = split_documents(documents)
-            vector_db = setup_or_load_vector_db(chunks, embedding_model)
-            bm25_model, corpus = setup_bm25(chunks)
-            st.success("✅ Financial documents re-indexed successfully!")
 
     query = st.text_input("🔍 Enter your financial query:")
 
@@ -132,13 +150,13 @@ def main():
 
         with st.spinner("Fetching financial data..."):
             retrieved_docs = hybrid_financial_retrieval(vector_db, bm25_model, corpus, validated_query)
-            ranked_docs = re_rank_results(retrieved_docs)
 
-            if not ranked_docs:
+            if not retrieved_docs:
                 st.error("❌ No relevant financial documents found. Try reindexing or refining your query.")
                 return
 
-            context = "\n\n".join([doc.page_content for doc in ranked_docs])
+            context = "\n\n".join([doc[0].page_content for doc in retrieved_docs])
+            confidence_score = np.mean([doc[1] for doc in retrieved_docs])
 
             with llm.chat_session():
                 raw_response = llm.generate(
@@ -147,15 +165,13 @@ def main():
                     f"Context:\n{context}", 
                     max_tokens=1024
                 )
-            
+
             response = filter_financial_ai_output(raw_response)
 
             # ✅ Display AI-generated response with confidence score
-            confidence_score = np.random.uniform(0.7, 0.95)  # Placeholder confidence score
             st.subheader("🤖 AI-Generated Financial Response:")
             st.write(response)
             st.markdown(f"**🔍 Confidence Score: {confidence_score:.2f}**")
 
-# ✅ Run Streamlit App
 if __name__ == "__main__":
     main()
