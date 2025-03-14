@@ -15,11 +15,11 @@ from langchain_core.documents import Document
 from langchain.memory import ConversationBufferMemory
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from tenacity import retry, stop_after_attempt, wait_fixed  
-
+print(sqlite3.sqlite_version)
 __import__('pysqlite3')
 import sys
 sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-print(sqlite3.sqlite_version)
+
 
 # Paths
 CHROMA_DB_DIR = "chroma_db"
