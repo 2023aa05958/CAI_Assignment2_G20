@@ -2,6 +2,7 @@ import os
 import re
 import pickle
 import streamlit as st
+import pysqlite3 as sqlite3
 import chromadb
 import json
 import numpy as np
